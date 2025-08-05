@@ -8729,6 +8729,15 @@ int LuaScriptInterface::luaAugmentGetDefenseModifiers(lua_State* L) {
 }
 
 
+void LuaScriptInterface::pushDamageModifier(lua_State* L, const std::shared_ptr<DamageModifier>& modifier) {
+    if (modifier) {
+        pushSharedPtr(L, modifier);
+        setMetatable(L, -1, "DamageModifier");
+    } else {
+        lua_pushnil(L);
+    }
+}
+
 // Container
 int LuaScriptInterface::luaContainerCreate(lua_State* L)
 {

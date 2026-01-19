@@ -222,7 +222,7 @@ class Monster final : public Creature
 
 		int64_t lastMeleeAttack = 0;
 
-		uint32_t attackTicks = 0;
+		uint32_t attackSpellThinkInterval = 1000;
 		uint32_t targetTicks = 0;
 		uint32_t targetChangeTicks = 0;
 		uint32_t defenseTicks = 0;
@@ -240,6 +240,10 @@ class Monster final : public Creature
 		bool isMasterInRange = false;
 		bool randomStepping = false;
 		bool walkingToSpawn = false;
+		bool attackSpellTimersInitialized = false;
+
+		std::vector<uint64_t> attackSpellNextDueMs;
+		uint64_t attackSpellNextDueMsMin = 0;
 
 		void onCreatureEnter(const CreaturePtr& creature);
 		void onCreatureLeave(const CreaturePtr& creature);
@@ -271,7 +275,7 @@ class Monster final : public Creature
 
 		bool canUseAttack(const Position& pos, const CreatureConstPtr& target) const;
 		bool canUseSpell(const Position& pos, const Position& targetPos,
-		                 const spellBlock_t& sb, uint32_t interval, bool& inRange, bool& resetTicks) const;
+		                 const spellBlock_t& sb, bool& inRange) const;
 		bool getRandomStep(const Position& creaturePos, Direction& direction);
 		bool getDanceStep(const Position& creaturePos, Direction& direction,
 		                  bool keepAttack = true, bool keepDistance = true);

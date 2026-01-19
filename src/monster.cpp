@@ -10,6 +10,9 @@
 #include "configmanager.h"
 #include "iologindata.h"
 
+#include <cmath>
+#include <limits>
+
 extern Game g_game;
 extern Monsters g_monsters;
 extern Events* g_events;
@@ -19,6 +22,41 @@ int32_t Monster::despawnRange;
 int32_t Monster::despawnRadius;
 
 uint32_t Monster::monsterAutoID = 0x40000000;
+
+namespace {
+uint32_t geometricTicks(const uint32_t chancePercent)
+{
+	if (chancePercent >= 100) {
+		return 1;
+	}
+
+	if (chancePercent == 0) {
+		return std::numeric_limits<uint32_t>::max();
+	}
+
+	const double p = chancePercent / 100.0;
+	const double u = (static_cast<double>(uniform_random(1, 1000000)) - 0.5) / 1000000.0;
+	const double steps = std::ceil(std::log(1.0 - u) / std::log(1.0 - p));
+
+	if (steps <= 1.0) {
+		return 1;
+	}
+
+	if (steps >= static_cast<double>(std::numeric_limits<uint32_t>::max())) {
+		return std::numeric_limits<uint32_t>::max();
+	}
+
+	return static_cast<uint32_t>(steps);
+}
+
+uint32_t clampInterval(const uint32_t intervalMs, const uint32_t fallbackMs)
+{
+	if (intervalMs == 0) {
+		return fallbackMs;
+	}
+	return intervalMs;
+}
+}
 
 MonsterPtr Monster::createMonster(const std::string& name)
 {
@@ -118,7 +156,9 @@ bool Monster::canWalkOnFieldType(const CombatType_t combatType) const
 
 void Monster::onAttackedCreatureDisappear(bool)
 {
-	attackTicks = 0;
+	attackSpellTimersInitialized = false;
+	attackSpellNextDueMs.clear();
+	attackSpellNextDueMsMin = 0;
 }
 
 void Monster::onCreatureAppear(const CreaturePtr& creature, const bool isLogin)
@@ -783,48 +823,109 @@ void Monster::doAttacking(const uint32_t interval)
     {
         return;
     }
-    bool resetTicks = interval != 0;
-    attackTicks += interval;
-    updateLookDirection();
+	if (interval > 0) {
+		attackSpellThinkInterval = interval;
+	}
+	if (attackSpellThinkInterval == 0) {
+		attackSpellThinkInterval = 1000;
+	}
+
+	const uint64_t now = OTSYS_TIME();
+	const auto& attackSpells = mType->info.attackSpells;
+	if (attackSpells.empty()) {
+		return;
+	}
+	if (!attackSpellTimersInitialized || attackSpellNextDueMs.size() != attackSpells.size()) {
+		attackSpellNextDueMs.assign(attackSpells.size(), 0);
+		attackSpellNextDueMsMin = std::numeric_limits<uint64_t>::max();
+		for (size_t i = 0; i < attackSpells.size(); ++i) {
+			if (attackSpells[i].chance == 0) {
+				attackSpellNextDueMs[i] = std::numeric_limits<uint64_t>::max();
+				continue;
+			}
+			const uint32_t ticks = geometricTicks(attackSpells[i].chance);
+			if (ticks == std::numeric_limits<uint32_t>::max()) {
+				attackSpellNextDueMs[i] = std::numeric_limits<uint64_t>::max();
+			} else {
+				attackSpellNextDueMs[i] = now + static_cast<uint64_t>(ticks) * attackSpellThinkInterval;
+			}
+			if (attackSpellNextDueMs[i] < attackSpellNextDueMsMin) {
+				attackSpellNextDueMsMin = attackSpellNextDueMs[i];
+			}
+		}
+		attackSpellTimersInitialized = true;
+	}
+
+	if (now < attackSpellNextDueMsMin) {
+		// Keep facing the target even when no spells are due.
+		if (lastMeleeAttack == 0) {
+			updateLookDirection();
+		}
+		return;
+	}
+
+	bool lookUpdated = false;
     const Position& myPos = getPosition();
     const Position& targetPos = attacked_creature->getPosition();
-    
-    // Generate ONE large random number
-    const uint64_t random_seed = static_cast<uint64_t>(uniform_random(0, UINT32_MAX));
-    uint32_t index = 0;
-    constexpr uint32_t hash_base = 2654435761u;
-    
-    auto ready_spells = mType->info.attackSpells 
-        | std::views::filter([random_seed, &index](const spellBlock_t& spell) { 
-            // Use different bits/hash of the seed for each spell
-            uint32_t spell_random = static_cast<uint32_t>((random_seed * hash_base + index++) >> 16) % 100 + 1;
-            return spell_random <= spell.chance;
-        });
-    
-    for (const spellBlock_t& spellBlock : ready_spells)
-    {
-        if (attackedCreature.expired()) 
-        {
-            break;
-        }
-        
-        bool inRange = false;
-        if (canUseSpell(myPos, targetPos, spellBlock, interval, inRange, resetTicks))
-        {
-            minCombatValue = spellBlock.minCombatValue;
-            maxCombatValue = spellBlock.maxCombatValue;
-            spellBlock.spell->castSpell(self, attacked_creature);
-            if (spellBlock.isMelee)
-            {
-                lastMeleeAttack = inRange ? OTSYS_TIME() : 0;
-            }
-        }
-    }
-    
-    if (resetTicks) 
-    {
-        attackTicks = 0;
-    }
+
+	bool rescheduledAny = false;
+	for (size_t i = 0; i < attackSpells.size(); ++i) {
+		const spellBlock_t& spellBlock = attackSpells[i];
+
+		if (now < attackSpellNextDueMs[i]) {
+			continue;
+		}
+
+		if (attackedCreature.expired()) {
+			break;
+		}
+
+		bool inRange = false;
+		if (!canUseSpell(myPos, targetPos, spellBlock, inRange)) {
+			attackSpellNextDueMs[i] = now + attackSpellThinkInterval;
+			rescheduledAny = true;
+			if (!inRange && spellBlock.isMelee) {
+				// Melee swing out of reach.
+				lastMeleeAttack = 0;
+			}
+			continue;
+		}
+
+		minCombatValue = spellBlock.minCombatValue;
+		maxCombatValue = spellBlock.maxCombatValue;
+		if (!lookUpdated) {
+			updateLookDirection();
+			lookUpdated = true;
+		}
+		spellBlock.spell->castSpell(self, attacked_creature);
+		if (spellBlock.isMelee) {
+			lastMeleeAttack = inRange ? OTSYS_TIME() : 0;
+		}
+
+		const uint32_t ticks = geometricTicks(spellBlock.chance);
+		if (ticks == std::numeric_limits<uint32_t>::max()) {
+			attackSpellNextDueMs[i] = std::numeric_limits<uint64_t>::max();
+		} else {
+			const uint32_t baseInterval = clampInterval(spellBlock.speed, attackSpellThinkInterval);
+			const uint64_t extraTicks = ticks > 1 ? static_cast<uint64_t>(ticks - 1) * attackSpellThinkInterval : 0;
+			attackSpellNextDueMs[i] = now + baseInterval + extraTicks;
+		}
+		rescheduledAny = true;
+	}
+
+	if (rescheduledAny) {
+		attackSpellNextDueMsMin = std::numeric_limits<uint64_t>::max();
+		for (const auto nextDue : attackSpellNextDueMs) {
+			if (nextDue < attackSpellNextDueMsMin) {
+				attackSpellNextDueMsMin = nextDue;
+			}
+		}
+	}
+
+	// Ensure ranged creatures turn to player when no spell cast updates it.
+	if (!lookUpdated && lastMeleeAttack == 0) {
+		updateLookDirection();
+	}
 }
 
 bool Monster::canUseAttack(const Position& pos, const CreatureConstPtr& target) const
@@ -843,22 +944,12 @@ bool Monster::canUseAttack(const Position& pos, const CreatureConstPtr& target) 
 }
 
 bool Monster::canUseSpell(const Position& pos, const Position& targetPos,
-                          const spellBlock_t& sb, const uint32_t interval, bool& inRange, bool& resetTicks) const
+                          const spellBlock_t& sb, bool& inRange) const
 {
 	inRange = true;
 
 	if (sb.isMelee) {
 		if (isFleeing() || (OTSYS_TIME() - lastMeleeAttack) < sb.speed) {
-			return false;
-		}
-	} else {
-		if (sb.speed > attackTicks) {
-			resetTicks = false;
-			return false;
-		}
-
-		if (attackTicks % sb.speed >= interval) {
-			//already used this spell for this round
 			return false;
 		}
 	}

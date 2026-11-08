@@ -488,7 +488,9 @@ if Modules == nil then
 
 		local player = Player(cid)
 		if player:isPremium() or not parameters.premium then
-			if player:removeTotalMoney(cost) then
+			if player:isPzLocked() then
+				module.npcHandler:say("Get out of there with this blood.", cid)
+			elseif player:removeTotalMoney(cost) then
 				local position = player:getPosition()
 				player:teleportTo(destination)
 
